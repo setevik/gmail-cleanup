@@ -1,0 +1,5 @@
+.venv/
+classified.json
+credentials.json
+token.json
+unread.json

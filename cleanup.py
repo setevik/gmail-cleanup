@@ -56,34 +56,59 @@ COMPOUND_TLDS = {
 # Known brand domain families to merge (maps alias → canonical)
 BRAND_DOMAIN_ALIASES = {
     "amazon.co.uk": "amazon.com",
-    "amazon.de": "amazon.de",      # keep separate? no, merge
+    "amazon.de": "amazon.com",
     "amazon.es": "amazon.com",
     "amazon.it": "amazon.com",
     "amazon.fr": "amazon.com",
-    "amazon.de": "amazon.com",
 }
 
 CATEGORIES = {
-    "PROMOTIONS":  "Promotions & Ads       (marketing, sales, coupons, deals, % off)",
-    "NEWSLETTERS": "Newsletters            (digests, subscriptions, company updates)",
-    "SOCIAL":      "Social Notifications   (LinkedIn, Twitter/X, Reddit, Facebook)",
-    "SYSTEM":      "System & Transactional (OTPs, receipts, shipping, bank alerts)",
-    "REVIEW":      "Review First           (personal, work, calendar — inspect manually)",
+    "SAFE_DELETE":   "Safe to Delete         (expired promos, old OTPs, delivered shipping, password resets)",
+    "NOISE":         "Noise / Spam           (unsolicited marketing, 'we miss you', cold outreach)",
+    "SOCIAL_NOISE":  "Social Noise           (endorsements, 'X liked your post', forum digests)",
+    "SAFE_ARCHIVE":  "Safe to Archive        (newsletters, order confirmations, bank statements)",
+    "SOCIAL_REAL":   "Social – Real          (DMs, mentions, direct replies on social platforms)",
+    "TRANSACTIONAL": "Transactional / Active (active orders, upcoming travel, pending actions)",
+    "REVIEW":        "Review First           (personal, work, calendar — inspect manually)",
+}
+
+# Default action per category (used when user quick-approves)
+CATEGORY_DEFAULT_ACTION = {
+    "SAFE_DELETE":   "delete",
+    "NOISE":         "delete",
+    "SOCIAL_NOISE":  "delete",
+    "SAFE_ARCHIVE":  "archive",
+    "SOCIAL_REAL":   "ignore",
+    "TRANSACTIONAL": "ignore",
+    "REVIEW":        "ignore",
 }
 
 CLASSIFY_SYSTEM = """\
-Classify each email by sender and subject into exactly one category.
+Classify each email into exactly one category based on sender, subject, age, and Gmail labels.
 Return ONLY a JSON array — no markdown, no explanation, no preamble.
 
 Categories:
-  PROMOTIONS  – marketing, ads, sales, deals, coupons, discount emails, "% off", anything with unsubscribe links
-  NEWSLETTERS – blog digests, subscriptions, weekly/monthly updates, announcements from companies/creators
-  SOCIAL      – LinkedIn, Twitter/X, Facebook, Instagram, Reddit, WhatsApp, Slack, forum notifications
-  SYSTEM      – OTP codes, shipping/delivery, bank/card alerts, invoices, receipts, password resets, booking confirmations
-  REVIEW      – personal messages, direct replies, work email, calendar invites, anything potentially important
+  SAFE_DELETE   – expired promotions, old OTP/verification codes, delivered shipping notifications,
+                  old password resets, old receipts (>3 months), "your code is ...", marketing that is clearly outdated
+  NOISE         – unsolicited marketing, cold outreach, "we miss you", spam-like ads, newsletters the user
+                  never engaged with, any promotional email with no ongoing value
+  SOCIAL_NOISE  – LinkedIn endorsements/skill assessments, "X liked your post", forum digest emails,
+                  social media summary notifications, "people you may know"
+  SAFE_ARCHIVE  – newsletters the user likely subscribed to, order confirmations, bank/card statements,
+                  travel booking confirmations (past trips), subscription renewal notices
+  SOCIAL_REAL   – direct messages, @mentions, direct replies on social platforms, personal LinkedIn messages
+  TRANSACTIONAL – active/upcoming orders, upcoming travel, pending payment, action-required items,
+                  recent (< 1 week old) OTPs or verifications
+  REVIEW        – personal messages, direct replies, work email, calendar invites, anything potentially important
+
+Key rules:
+- Email age matters: a 6-month-old OTP is SAFE_DELETE, a 1-day-old OTP is TRANSACTIONAL
+- Gmail labels are hints, not final answers: CATEGORY_PROMOTIONS does NOT automatically mean NOISE
+- When in doubt between delete and archive, prefer archive
+- When in doubt between archive and review, prefer REVIEW
 
 Output format (JSON array, no other text):
-[{"id": "...", "category": "PROMOTIONS|NEWSLETTERS|SOCIAL|SYSTEM|REVIEW"}, ...]
+[{"id": "...", "category": "SAFE_DELETE|NOISE|SOCIAL_NOISE|SAFE_ARCHIVE|SOCIAL_REAL|TRANSACTIONAL|REVIEW"}, ...]
 """
 
 # ── Gmail auth ────────────────────────────────────────────────────────────────
@@ -144,6 +169,24 @@ def parse_email_date(date_str):
         return dt.replace(tzinfo=None)
     except Exception:
         return None
+
+def email_age_label(date_str):
+    """Return a human-readable age string like '3 months old' or '2 years old'."""
+    dt = parse_email_date(date_str)
+    if not dt:
+        return "unknown age"
+    delta = datetime.now() - dt
+    days = delta.days
+    if days < 1:
+        return "today"
+    elif days < 7:
+        return f"{days} days old"
+    elif days < 30:
+        return f"{days // 7} weeks old"
+    elif days < 365:
+        return f"{days // 30} months old"
+    else:
+        return f"{days // 365} years old"
 
 def filter_by_cutoff(emails, cutoff):
     """Return emails older than (before) the cutoff date."""
@@ -225,12 +268,12 @@ def getchar(prompt=""):
     except ImportError:
         return input().strip().lower()
 
-def save_progress(actions, completed_cats):
+def save_progress(actions, completed_groups):
     """Save report progress for recovery."""
     save_json(PROGRESS_FILE, {
         "delete": actions["delete"],
         "archive": actions["archive"],
-        "completed_categories": completed_cats,
+        "completed_groups": completed_groups,
     })
 
 def load_progress():
@@ -239,7 +282,7 @@ def load_progress():
     if data:
         return (
             {"delete": data.get("delete", []), "archive": data.get("archive", [])},
-            data.get("completed_categories", []),
+            data.get("completed_groups", data.get("completed_categories", [])),
         )
     return {"delete": [], "archive": []}, []
 
@@ -324,40 +367,22 @@ def cmd_classify():
         sys.exit(1)
 
     emails = data["emails"]
-    print(f"\n🧠  Classifying {len(emails):,} emails with Claude…\n")
-
-    # Pre-classify by Gmail system labels (fast, free)
-    label_map = {
-        "CATEGORY_PROMOTIONS": "PROMOTIONS",
-        "CATEGORY_SOCIAL":     "SOCIAL",
-        "CATEGORY_UPDATES":    "NEWSLETTERS",
-        "CATEGORY_FORUMS":     "SOCIAL",
-    }
-
-    pre_classified = {}
-    to_classify    = []
-    for e in emails:
-        matched = None
-        for lbl, cat in label_map.items():
-            if lbl in e.get("labels", []):
-                matched = cat
-                break
-        if matched:
-            pre_classified[e["id"]] = matched
-        else:
-            to_classify.append(e)
-
-    print(f"  ⚡  {len(pre_classified):,} pre-classified via Gmail labels")
-    print(f"  🔍  {len(to_classify):,} remaining → sending to Claude\n")
+    print(f"\n🧠  Classifying {len(emails):,} emails with Claude (all emails, no pre-classification)…\n")
 
     client      = anthropic.Anthropic()
-    results     = dict(pre_classified)
-    batches     = [to_classify[i:i+CLASSIFY_BATCH] for i in range(0, len(to_classify), CLASSIFY_BATCH)]
+    results     = {}
+    batches     = [emails[i:i+CLASSIFY_BATCH] for i in range(0, len(emails), CLASSIFY_BATCH)]
     errors      = 0
 
     for bi, batch in enumerate(batches):
-        progress(bi * CLASSIFY_BATCH, len(to_classify), "classifying")
-        payload = [{"id": e["id"], "subject": e["subject"], "from": e["from"]} for e in batch]
+        progress(bi * CLASSIFY_BATCH, len(emails), "classifying")
+        payload = [{
+            "id": e["id"],
+            "subject": e["subject"],
+            "from": e["from"],
+            "age": email_age_label(e.get("date", "")),
+            "gmail_labels": [l for l in e.get("labels", []) if l.startswith("CATEGORY_")],
+        } for e in batch]
 
         try:
             resp = client.messages.create(
@@ -382,7 +407,7 @@ def cmd_classify():
 
         time.sleep(0.3)
 
-    progress(len(to_classify), len(to_classify), "done")
+    progress(len(emails), len(emails), "done")
     print(f"\n\n  ✅  Classification complete  ({errors} fallbacks to REVIEW)\n")
 
     # Build classified structure
@@ -399,7 +424,32 @@ def cmd_classify():
     print(f"  💾  Saved → {CLASSIFIED_FILE}\n")
 
     # Print quick summary
-    cmd_report(show_header=False)
+    _print_summary(classified)
+
+# ── Shared summary printer ────────────────────────────────────────────────────
+
+def _print_summary(by_cat):
+    """Print category counts with default action hints."""
+    total = sum(len(emails) for emails in by_cat.values())
+    n_delete  = 0
+    n_archive = 0
+    n_ignore  = 0
+
+    for cat, desc in CATEGORIES.items():
+        n = len(by_cat.get(cat, []))
+        action = CATEGORY_DEFAULT_ACTION[cat]
+        icon = {"delete": "🗑️", "archive": "📦", "ignore": "👁️"}[action]
+        bar = "█" * min(40, int(n / max(total, 1) * 40))
+        print(f"  {icon} {cat:<14} {n:>5,}  {bar}")
+        if action == "delete":
+            n_delete += n
+        elif action == "archive":
+            n_archive += n
+        else:
+            n_ignore += n
+
+    print(f"  {'TOTAL':<16} {total:>5,}\n")
+    print(f"  Quick-approve defaults: 🗑️ {n_delete:,} delete / 📦 {n_archive:,} archive / 👁️ {n_ignore:,} ignore\n")
 
 # ── STAGE 3: Report ───────────────────────────────────────────────────────────
 
@@ -419,29 +469,47 @@ def cmd_report(show_header=True):
     filtered_cat = {cat: filter_by_cutoff(emails, cutoff) for cat, emails in by_cat.items()}
     total = sum(len(emails) for emails in filtered_cat.values())
 
-    # Summary overview
-    for cat, desc in CATEGORIES.items():
-        n = len(filtered_cat.get(cat, []))
-        bar = "█" * min(40, int(n / max(total, 1) * 40))
-        print(f"  {cat:<14} {n:>5,}  {bar}")
-    print(f"  {'TOTAL':<14} {total:>5,}\n")
+    # Summary overview with default actions
+    _print_summary(filtered_cat)
 
     # Load saved progress (for recovery)
-    actions, completed_cats = load_progress()
-    if completed_cats:
-        print(f"  ↩️  Resuming — {len(completed_cats)} categories already done: {', '.join(completed_cats)}\n")
+    actions, completed_groups = load_progress()
+    if completed_groups:
+        print(f"  ↩️  Resuming — {len(completed_groups)} groups already done\n")
 
+    # Quick-approve mode
+    if "quick_done" not in completed_groups:
+        print(f"  {'─'*65}")
+        ans = input("  Quick-approve all defaults? [Y]es / [N]o, review per category: ").strip().lower()
+        if ans in ("y", "yes", ""):
+            for cat in CATEGORIES:
+                action = CATEGORY_DEFAULT_ACTION[cat]
+                emails = filtered_cat.get(cat, [])
+                if action == "delete":
+                    actions["delete"].extend(e["id"] for e in emails)
+                elif action == "archive":
+                    actions["archive"].extend(e["id"] for e in emails)
+            completed_groups.append("quick_done")
+            for cat in CATEGORIES:
+                if cat not in completed_groups:
+                    completed_groups.append(cat)
+            save_progress(actions, completed_groups)
+        else:
+            completed_groups.append("quick_done")
+            save_progress(actions, completed_groups)
+
+    # Per-category review (skipped if quick-approved)
     for cat, desc in CATEGORIES.items():
         emails = filtered_cat.get(cat, [])
         if not emails:
             continue
 
-        # Skip already-completed categories
-        if cat in completed_cats:
+        if cat in completed_groups:
             continue
 
-        print(f"  {'─'*65}")
-        print(f"  📂 {cat}  ({len(emails):,} emails)")
+        default_action = CATEGORY_DEFAULT_ACTION[cat]
+        print(f"\n  {'─'*65}")
+        print(f"  📂 {cat}  ({len(emails):,} emails)  [default: {default_action}]")
         print(f"     {desc}\n")
 
         # Group by sender, show all
@@ -455,27 +523,33 @@ def cmd_report(show_header=True):
 
         print()
 
-        if cat == "REVIEW":
-            print(f"     (REVIEW items default to ignore — press Enter to skip)\n")
-
         # Ask for action on this category
         while True:
             prompt = (
                 f"  Action for {cat}? "
-                f"[I]gnore all / [D]elete all / [A]rchive all / [S]elect per sender: "
+                f"[Enter={default_action}] / [I]gnore / [D]elete / [A]rchive / [S]elect per sender: "
             )
             ans = input(prompt).strip().lower()
-            if ans in ("i", "ignore", ""):
+            if ans == "":
+                # Apply default action
+                if default_action == "delete":
+                    actions["delete"].extend(e["id"] for e in emails)
+                    print(f"  🗑️  {len(emails):,} marked for deletion\n")
+                elif default_action == "archive":
+                    actions["archive"].extend(e["id"] for e in emails)
+                    print(f"  📦 {len(emails):,} marked for archive\n")
+                else:
+                    print(f"  ⏭️  Ignored\n")
+                break
+            elif ans in ("i", "ignore"):
                 print(f"  ⏭️  Ignored\n")
                 break
             elif ans in ("d", "delete"):
-                for e in emails:
-                    actions["delete"].append(e["id"])
+                actions["delete"].extend(e["id"] for e in emails)
                 print(f"  🗑️  {len(emails):,} marked for deletion\n")
                 break
             elif ans in ("a", "archive"):
-                for e in emails:
-                    actions["archive"].append(e["id"])
+                actions["archive"].extend(e["id"] for e in emails)
                 print(f"  📦 {len(emails):,} marked for archive\n")
                 break
             elif ans in ("s", "select"):
@@ -484,12 +558,11 @@ def cmd_report(show_header=True):
                 for sender, count in sender_groups:
                     org_domain = extract_org_domain(sender)
                     if org_domain in PUBLIC_EMAIL_DOMAINS:
-                        # Public provider: use full sender as key
                         key = sender
                         label = truncate(sender, 50)
                     else:
                         key = org_domain
-                        label = None  # will be built from group
+                        label = None
 
                     if key not in domain_groups:
                         domain_groups[key] = {"senders": [], "emails": [], "count": 0, "label": label}
@@ -519,28 +592,25 @@ def cmd_report(show_header=True):
                         if choice in ("i", ""):
                             break
                         elif choice == "d":
-                            for e in grp["emails"]:
-                                actions["delete"].append(e["id"])
+                            actions["delete"].extend(e["id"] for e in grp["emails"])
                             break
                         elif choice == "a":
-                            for e in grp["emails"]:
-                                actions["archive"].append(e["id"])
+                            actions["archive"].extend(e["id"] for e in grp["emails"])
                             break
                         elif choice == "\r" or choice == "\n":
-                            # Enter key in raw mode
                             break
                         else:
                             print("       Enter i, d, or a")
                 print()
                 break
             else:
-                print("     Enter I, D, A, or S")
+                print("     Enter I, D, A, S, or press Enter for default")
 
         # Save progress after each category
-        completed_cats.append(cat)
-        save_progress(actions, completed_cats)
+        completed_groups.append(cat)
+        save_progress(actions, completed_groups)
 
-    # Deduplicate IDs (an email could appear in multiple sender groups theoretically)
+    # Deduplicate IDs
     actions["delete"] = list(dict.fromkeys(actions["delete"]))
     actions["archive"] = list(dict.fromkeys(actions["archive"]))
 
@@ -607,10 +677,11 @@ def cmd_export():
         print(f"\n❌  {CLASSIFIED_FILE} not found. Run classify first.\n")
         sys.exit(1)
 
-    rows = [["category", "from", "subject", "date", "id"]]
+    rows = [["category", "default_action", "from", "subject", "date", "id"]]
     for cat, emails in data["by_category"].items():
+        action = CATEGORY_DEFAULT_ACTION.get(cat, "ignore")
         for e in emails:
-            rows.append([cat, e["from"], e["subject"], e["date"], e["id"]])
+            rows.append([cat, action, e["from"], e["subject"], e["date"], e["id"]])
 
     with open(EXPORT_FILE, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerows(rows)
