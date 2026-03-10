@@ -42,11 +42,8 @@ python cleanup.py fetch
 # 2. Classify with Claude → classified.json (~3-4 min for 8K emails)
 python cleanup.py classify
 
-# 3. Print summary report
+# 3. Interactive report
 python cleanup.py report
-
-# 4. Interactive approval + trash
-python cleanup.py trash
 
 # Optional: export to CSV for deeper inspection
 python cleanup.py export

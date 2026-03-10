@@ -4,14 +4,18 @@ Gmail Unread Cleanup
 Usage:
   python cleanup.py fetch       -- fetch all unread metadata → unread.json
   python cleanup.py classify    -- classify with Claude      → classified.json
-  python cleanup.py report      -- print summary report
-  python cleanup.py trash       -- interactive approve & trash
+  python cleanup.py report      -- interactive report: review, delete, archive
   python cleanup.py export      -- export classified.csv
+
+Environment:
+  CUTOFF_DATE=YYYY-MM-DD   Only report/trash emails older than this date
+                           (default: 1 year ago)
 """
 
-import os, sys, json, time, csv, textwrap
+import os, sys, json, time, csv, textwrap, re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -26,6 +30,38 @@ CLASSIFY_BATCH  = 80          # emails per Claude call
 METADATA_BATCH  = 100         # emails per Gmail batch-get
 LIST_PAGE_SIZE  = 500         # max Gmail list page size
 TRASH_BATCH     = 1000        # batchModify supports up to 1000
+PROGRESS_FILE   = "report_progress.json"
+
+# Domains where each sender is a different person (not grouped)
+PUBLIC_EMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com",
+    "outlook.com", "hotmail.com", "live.com", "msn.com",
+    "yahoo.com", "ymail.com",
+    "aol.com",
+    "mail.ru", "inbox.ru", "list.ru", "yandex.ru", "ya.ru",
+    "protonmail.com", "proton.me",
+    "icloud.com", "me.com", "mac.com",
+    "013net.net",
+}
+
+# Compound TLD suffixes (domain = last 3 parts instead of 2)
+COMPOUND_TLDS = {
+    "co.il", "org.il", "ac.il", "gov.il", "net.il",
+    "co.uk", "org.uk", "ac.uk",
+    "com.au", "edu.au", "org.au",
+    "co.in", "co.jp", "co.kr",
+    "com.br", "com.ru",
+}
+
+# Known brand domain families to merge (maps alias → canonical)
+BRAND_DOMAIN_ALIASES = {
+    "amazon.co.uk": "amazon.com",
+    "amazon.de": "amazon.de",      # keep separate? no, merge
+    "amazon.es": "amazon.com",
+    "amazon.it": "amazon.com",
+    "amazon.fr": "amazon.com",
+    "amazon.de": "amazon.com",
+}
 
 CATEGORIES = {
     "PROMOTIONS":  "Promotions & Ads       (marketing, sales, coupons, deals, % off)",
@@ -94,10 +130,124 @@ def header(val, headers):
 def truncate(s, n=80):
     return s[:n] + "…" if len(s) > n else s
 
+def get_cutoff_date():
+    """Return cutoff datetime from CUTOFF_DATE env var (YYYY-MM-DD) or default 1 year ago."""
+    raw = os.environ.get("CUTOFF_DATE", "")
+    if raw:
+        return datetime.strptime(raw, "%Y-%m-%d")
+    return datetime.now() - timedelta(days=365)
+
+def parse_email_date(date_str):
+    """Parse an email Date header into a naive datetime, or None on failure."""
+    try:
+        dt = parsedate_to_datetime(date_str)
+        return dt.replace(tzinfo=None)
+    except Exception:
+        return None
+
+def filter_by_cutoff(emails, cutoff):
+    """Return emails older than (before) the cutoff date."""
+    result = []
+    for e in emails:
+        dt = parse_email_date(e.get("date", ""))
+        if dt and dt < cutoff:
+            result.append(e)
+    return result
+
 def progress(done, total, label="", width=40):
     pct  = done / total if total else 0
     bar  = "█" * int(pct * width) + "░" * (width - int(pct * width))
     print(f"\r  [{bar}] {done:,}/{total:,} {label}", end="", flush=True)
+
+def extract_org_domain(from_header):
+    """Extract the organizational domain from a From header.
+    e.g. 'Foo <no-reply@t.mail.coursera.org>' → 'coursera.org'
+    """
+    # Extract email address from "Name <email>" or bare email
+    match = re.search(r'<([^>]+)>', from_header)
+    if match:
+        addr = match.group(1)
+    elif '@' in from_header:
+        addr = from_header.strip()
+    else:
+        return from_header.strip()
+
+    parts = addr.split('@')
+    if len(parts) != 2:
+        return from_header.strip()
+
+    domain = parts[1].lower()
+
+    # Apply brand aliases first
+    if domain in BRAND_DOMAIN_ALIASES:
+        return BRAND_DOMAIN_ALIASES[domain]
+
+    # Check compound TLDs
+    domain_parts = domain.split('.')
+    for tld in COMPOUND_TLDS:
+        if domain.endswith('.' + tld):
+            # Take the part just before the compound TLD
+            tld_len = len(tld.split('.'))
+            if len(domain_parts) > tld_len:
+                return '.'.join(domain_parts[-(tld_len + 1):])
+            return domain
+
+    # Also check for brand aliases on the org domain level
+    # e.g. sub.amazon.co.uk → amazon.co.uk → amazon.com
+    org = '.'.join(domain_parts[-2:]) if len(domain_parts) >= 2 else domain
+    if org in BRAND_DOMAIN_ALIASES:
+        return BRAND_DOMAIN_ALIASES[org]
+
+    return org
+
+def getchar(prompt=""):
+    """Read a single character without requiring Enter.
+    Falls back to input() if not a tty."""
+    if prompt:
+        print(prompt, end="", flush=True)
+    if not sys.stdin.isatty():
+        return input().strip().lower()
+    try:
+        import tty, termios
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        # Handle Ctrl-C / Ctrl-D
+        if ch in ('\x03', '\x04'):
+            print()
+            raise KeyboardInterrupt
+        print(ch)  # echo the character
+        return ch.lower()
+    except ImportError:
+        return input().strip().lower()
+
+def save_progress(actions, completed_cats):
+    """Save report progress for recovery."""
+    save_json(PROGRESS_FILE, {
+        "delete": actions["delete"],
+        "archive": actions["archive"],
+        "completed_categories": completed_cats,
+    })
+
+def load_progress():
+    """Load saved report progress, or return empty state."""
+    data = load_json(PROGRESS_FILE)
+    if data:
+        return (
+            {"delete": data.get("delete", []), "archive": data.get("archive", [])},
+            data.get("completed_categories", []),
+        )
+    return {"delete": [], "archive": []}, []
+
+def clear_progress():
+    """Remove progress file after successful completion."""
+    p = Path(PROGRESS_FILE)
+    if p.exists():
+        p.unlink()
 
 # ── STAGE 1: Fetch ────────────────────────────────────────────────────────────
 
@@ -111,7 +261,7 @@ def cmd_fetch():
     page = 0
     while True:
         page += 1
-        kwargs = dict(userId="me", q="is:unread", maxResults=LIST_PAGE_SIZE)
+        kwargs = dict(userId="me", labelIds=["INBOX", "UNREAD"], maxResults=LIST_PAGE_SIZE)
         if token:
             kwargs["pageToken"] = token
         resp = svc.users().messages().list(**kwargs).execute()
@@ -254,126 +404,202 @@ def cmd_classify():
 # ── STAGE 3: Report ───────────────────────────────────────────────────────────
 
 def cmd_report(show_header=True):
+    from collections import Counter, OrderedDict
+
     data = load_json(CLASSIFIED_FILE)
     if not data:
         print(f"\n❌  {CLASSIFIED_FILE} not found. Run classify first.\n")
         sys.exit(1)
 
+    cutoff = get_cutoff_date()
     if show_header:
-        print("\n📊  Classification Report\n")
+        print(f"\n📊  Interactive Report  (emails before {cutoff.strftime('%Y-%m-%d')})\n")
 
     by_cat = data["by_category"]
-    total  = data["total"]
+    filtered_cat = {cat: filter_by_cutoff(emails, cutoff) for cat, emails in by_cat.items()}
+    total = sum(len(emails) for emails in filtered_cat.values())
 
+    # Summary overview
     for cat, desc in CATEGORIES.items():
-        emails = by_cat.get(cat, [])
-        n      = len(emails)
-        bar    = "█" * min(40, int(n / max(total, 1) * 40))
+        n = len(filtered_cat.get(cat, []))
+        bar = "█" * min(40, int(n / max(total, 1) * 40))
         print(f"  {cat:<14} {n:>5,}  {bar}")
-        print(f"               {desc}")
+    print(f"  {'TOTAL':<14} {total:>5,}\n")
 
-        # Top 5 senders
-        from collections import Counter
-        senders = Counter(e["from"] for e in emails).most_common(5)
-        for sender, count in senders:
-            print(f"               · {truncate(sender, 55)}  ×{count}")
-        print()
-
-    deletable = sum(len(by_cat.get(c, [])) for c in ["PROMOTIONS","NEWSLETTERS","SOCIAL","SYSTEM"])
-    print(f"  {'TOTAL':<14} {total:>5,}")
-    print(f"  Deletable (excl. REVIEW): {deletable:,}  ({deletable/total*100:.0f}%)\n")
-
-# ── STAGE 4: Trash ────────────────────────────────────────────────────────────
-
-def cmd_trash():
-    data = load_json(CLASSIFIED_FILE)
-    if not data:
-        print(f"\n❌  {CLASSIFIED_FILE} not found. Run classify first.\n")
-        sys.exit(1)
-
-    print("\n🗑️   Interactive Trash\n")
-    print("  For each category, confirm whether to move emails to Trash.")
-    print("  Trashed emails are recoverable for 30 days.\n")
-
-    by_cat   = data["by_category"]
-    approved = []
+    # Load saved progress (for recovery)
+    actions, completed_cats = load_progress()
+    if completed_cats:
+        print(f"  ↩️  Resuming — {len(completed_cats)} categories already done: {', '.join(completed_cats)}\n")
 
     for cat, desc in CATEGORIES.items():
-        if cat == "REVIEW":
-            print(f"  🔒 REVIEW ({len(by_cat.get(cat, [])):,}) — always skipped\n")
-            continue
-
-        emails = by_cat.get(cat, [])
+        emails = filtered_cat.get(cat, [])
         if not emails:
-            print(f"  ⬜ {cat} — 0 emails, skipping\n")
             continue
 
-        print(f"  {'─'*60}")
+        # Skip already-completed categories
+        if cat in completed_cats:
+            continue
+
+        print(f"  {'─'*65}")
         print(f"  📂 {cat}  ({len(emails):,} emails)")
-        print(f"     {desc}")
+        print(f"     {desc}\n")
+
+        # Group by sender, show all
+        sender_groups = Counter(e["from"] for e in emails).most_common()
+        emails_by_sender = {}
+        for e in emails:
+            emails_by_sender.setdefault(e["from"], []).append(e)
+
+        for idx, (sender, count) in enumerate(sender_groups, 1):
+            print(f"  {idx:>4}. {truncate(sender, 55)}  ×{count}")
+
         print()
 
-        # Show sample
-        for e in emails[:5]:
-            print(f"     · {truncate(e['from'], 35):<36} {truncate(e['subject'], 50)}")
-        if len(emails) > 5:
-            print(f"     … and {len(emails)-5:,} more")
-        print()
+        if cat == "REVIEW":
+            print(f"     (REVIEW items default to ignore — press Enter to skip)\n")
 
+        # Ask for action on this category
         while True:
-            ans = input(f"  Trash {len(emails):,} emails in {cat}? [y/n/s=show more] ").strip().lower()
-            if ans == "s":
-                for e in emails[:25]:
-                    print(f"     {truncate(e['from'],35):<36} {truncate(e['subject'],50)}")
-                if len(emails) > 25:
-                    print(f"     … and {len(emails)-25:,} more")
-                print()
-            elif ans in ("y", "yes"):
-                approved.extend(e["id"] for e in emails)
-                print(f"  ✅ {len(emails):,} queued\n")
+            prompt = (
+                f"  Action for {cat}? "
+                f"[I]gnore all / [D]elete all / [A]rchive all / [S]elect per sender: "
+            )
+            ans = input(prompt).strip().lower()
+            if ans in ("i", "ignore", ""):
+                print(f"  ⏭️  Ignored\n")
                 break
-            elif ans in ("n", "no"):
-                print(f"  ⏭️  Skipped\n")
+            elif ans in ("d", "delete"):
+                for e in emails:
+                    actions["delete"].append(e["id"])
+                print(f"  🗑️  {len(emails):,} marked for deletion\n")
+                break
+            elif ans in ("a", "archive"):
+                for e in emails:
+                    actions["archive"].append(e["id"])
+                print(f"  📦 {len(emails):,} marked for archive\n")
+                break
+            elif ans in ("s", "select"):
+                # Build domain-grouped view
+                domain_groups = OrderedDict()  # domain → {senders: [...], emails: [...], count: N}
+                for sender, count in sender_groups:
+                    org_domain = extract_org_domain(sender)
+                    if org_domain in PUBLIC_EMAIL_DOMAINS:
+                        # Public provider: use full sender as key
+                        key = sender
+                        label = truncate(sender, 50)
+                    else:
+                        key = org_domain
+                        label = None  # will be built from group
+
+                    if key not in domain_groups:
+                        domain_groups[key] = {"senders": [], "emails": [], "count": 0, "label": label}
+
+                    domain_groups[key]["senders"].append(sender)
+                    domain_groups[key]["emails"].extend(emails_by_sender[sender])
+                    domain_groups[key]["count"] += count
+
+                # Sort by count descending
+                sorted_groups = sorted(domain_groups.items(), key=lambda x: -x[1]["count"])
+
+                # Build labels for domain groups
+                for key, grp in sorted_groups:
+                    if grp["label"] is None:
+                        if len(grp["senders"]) == 1:
+                            grp["label"] = truncate(grp["senders"][0], 50)
+                        else:
+                            grp["label"] = f"*@{key} ({len(grp['senders'])} senders)"
+
+                n_groups = len(sorted_groups)
+                print(f"\n  Per-sender actions ({n_groups} groups, Enter=ignore, d=delete, a=archive):\n")
+                for idx, (key, grp) in enumerate(sorted_groups, 1):
+                    while True:
+                        choice = getchar(
+                            f"    [{idx}/{n_groups}] {grp['label']}  ×{grp['count']}  [i/d/a]: "
+                        )
+                        if choice in ("i", ""):
+                            break
+                        elif choice == "d":
+                            for e in grp["emails"]:
+                                actions["delete"].append(e["id"])
+                            break
+                        elif choice == "a":
+                            for e in grp["emails"]:
+                                actions["archive"].append(e["id"])
+                            break
+                        elif choice == "\r" or choice == "\n":
+                            # Enter key in raw mode
+                            break
+                        else:
+                            print("       Enter i, d, or a")
+                print()
                 break
             else:
-                print("     Please enter y, n, or s")
+                print("     Enter I, D, A, or S")
 
-    if not approved:
-        print("  Nothing approved for deletion. Exiting.\n")
+        # Save progress after each category
+        completed_cats.append(cat)
+        save_progress(actions, completed_cats)
+
+    # Deduplicate IDs (an email could appear in multiple sender groups theoretically)
+    actions["delete"] = list(dict.fromkeys(actions["delete"]))
+    actions["archive"] = list(dict.fromkeys(actions["archive"]))
+
+    # Summary of planned actions
+    print(f"\n  {'═'*65}")
+    print(f"  📋 Action Summary:")
+    print(f"     Delete:  {len(actions['delete']):,} emails  (moved to Trash, recoverable 30 days)")
+    print(f"     Archive: {len(actions['archive']):,} emails  (removed from Inbox, kept in All Mail)")
+
+    if not actions["delete"] and not actions["archive"]:
+        print(f"\n  Nothing to do. Exiting.\n")
+        clear_progress()
         return
 
-    print(f"\n  {'─'*60}")
-    print(f"  📋 Total queued: {len(approved):,} emails")
-    print(f"  These will be moved to Gmail Trash (recoverable for 30 days).")
-    final = input(f"\n  Proceed? [yes/no] ").strip().lower()
+    final = input(f"\n  Execute these actions? [yes/no]: ").strip().lower()
     if final not in ("yes", "y"):
-        print("  Aborted.\n")
+        print("  Aborted. Progress saved — re-run report to resume or modify.\n")
         return
 
-    print(f"\n  Moving {len(approved):,} emails to Trash…\n")
-    svc    = get_gmail_service()
-    done   = 0
-    errors = 0
-    batches = [approved[i:i+TRASH_BATCH] for i in range(0, len(approved), TRASH_BATCH)]
+    svc = get_gmail_service()
 
+    # Execute deletions (trash)
+    if actions["delete"]:
+        print(f"\n  Moving {len(actions['delete']):,} emails to Trash…\n")
+        _batch_modify(svc, actions["delete"],
+                      add_labels=["TRASH"], remove_labels=["INBOX"],
+                      label="trashing")
+
+    # Execute archives
+    if actions["archive"]:
+        print(f"\n  Archiving {len(actions['archive']):,} emails…\n")
+        _batch_modify(svc, actions["archive"],
+                      add_labels=[], remove_labels=["INBOX", "UNREAD"],
+                      label="archiving")
+
+    clear_progress()
+    print(f"\n  🎉  All done!\n")
+
+
+def _batch_modify(svc, ids, add_labels, remove_labels, label=""):
+    """Batch-modify Gmail messages with progress."""
+    done = 0
+    errors = 0
+    batches = [ids[i:i+TRASH_BATCH] for i in range(0, len(ids), TRASH_BATCH)]
     for batch_ids in batches:
         try:
-            svc.users().messages().batchModify(
-                userId="me",
-                body={"ids": batch_ids, "addLabelIds": ["TRASH"], "removeLabelIds": ["INBOX", "UNREAD"]},
-            ).execute()
+            body = {"ids": batch_ids, "removeLabelIds": remove_labels}
+            if add_labels:
+                body["addLabelIds"] = add_labels
+            svc.users().messages().batchModify(userId="me", body=body).execute()
             done += len(batch_ids)
-            progress(done, len(approved), "trashing")
+            progress(done, len(ids), label)
             time.sleep(0.2)
         except Exception as ex:
             errors += len(batch_ids)
             print(f"\n  ⚠️  Batch error: {ex}")
+    print(f"\n  ✅  {done:,} processed  ({errors} errors)")
 
-    print(f"\n\n  🎉  Done!  {done:,} moved to Trash  ({errors} errors)\n")
-    if errors:
-        print(f"  ⚠️  {errors} emails failed — check Gmail manually.\n")
-
-# ── STAGE 5: Export CSV ───────────────────────────────────────────────────────
+# ── STAGE 4: Export CSV ───────────────────────────────────────────────────────
 
 def cmd_export():
     data = load_json(CLASSIFIED_FILE)
@@ -397,7 +623,6 @@ COMMANDS = {
     "fetch":    cmd_fetch,
     "classify": cmd_classify,
     "report":   cmd_report,
-    "trash":    cmd_trash,
     "export":   cmd_export,
 }
 
