@@ -1,6 +1,6 @@
 # Gmail Unread Cleanup
 
-One-time cleanup of unread Gmail. Fetch → Classify (Claude AI) → Review → Trash.
+Bulk cleanup of unread Gmail. Fetch → Classify (Claude AI) → Review → Trash/Archive. Plus automatic Gmail filter creation from read/unread patterns.
 
 ---
 
@@ -33,56 +33,110 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 ## Usage
 
-Run stages in order:
+### Core workflow (run in order)
 
 ```bash
-# 1. Fetch all unread metadata → unread.json (~2-3 min for 8K emails)
+# 1. Fetch all unread metadata → unread.json
 python cleanup.py fetch
 
-# 2. Classify with Claude → classified.json (~3-4 min for 8K emails)
+# 2. Classify with Claude → classified.json
 python cleanup.py classify
 
-# 3. Interactive report
+# 3. Interactive report — review, delete, archive
 python cleanup.py report
 
-# Optional: export to CSV for deeper inspection
+# 4. (Optional) Export to CSV for spreadsheet review
 python cleanup.py export
+```
+
+### Gmail filter creation
+
+```bash
+# Analyze 3 months of read/unread patterns → propose and create Gmail filters
+python cleanup.py filters
 ```
 
 Each stage saves its output as a JSON file so you can resume or re-run any step independently.
 
 ---
 
-## How it works
+## Commands
 
-| Stage    | What it does                                                                 |
-|----------|------------------------------------------------------------------------------|
-| `fetch`  | Lists all unread IDs via Gmail API, then batch-fetches subject/from/date     |
-| `classify` | Gmail labels pre-classify Promotions/Social/Updates; Claude handles the rest |
-| `trash`  | `batchModify` moves up to 1000 emails per API call, very fast               |
+| Command | What it does |
+|---------|-------------|
+| `fetch` | Lists all unread message IDs via Gmail API, then batch-fetches subject/from/date/labels → `unread.json` |
+| `classify` | Gmail labels pre-classify Promotions/Social/Updates; Claude (Sonnet 4) classifies the rest into 7 categories → `classified.json` |
+| `report` | Interactive review: quick-approve defaults, per-category review, or per-sender selection. Executes trash/archive via `batchModify` |
+| `export` | Flat CSV export of classified emails → `classified.csv` |
+| `filters` | Analyzes 3 months of inbox read/unread patterns, uses Claude for subject analysis, proposes Gmail filters, optionally auto-creates them |
 
-## Categories
+---
 
-| Category      | Description                                              |
-|---------------|----------------------------------------------------------|
-| `PROMOTIONS`  | Marketing, ads, sales, coupons, deals                   |
-| `NEWSLETTERS` | Blog digests, subscriptions, company updates             |
-| `SOCIAL`      | LinkedIn, Twitter/X, Reddit, Facebook notifications      |
-| `SYSTEM`      | OTPs, shipping, bank alerts, invoices, receipts          |
-| `REVIEW`      | Personal messages, work email — **never auto-deleted**   |
+## Classification categories
 
-## Safety
+| Category | Default action | Description |
+|----------|---------------|-------------|
+| `SAFE_DELETE` | delete | Expired promos, old OTPs, delivered shipping notifications, old receipts |
+| `NOISE` | delete | Unsolicited marketing, cold outreach, spam-like ads |
+| `SOCIAL_NOISE` | delete | LinkedIn endorsements, "X liked your post", forum digests |
+| `SAFE_ARCHIVE` | archive | Subscribed newsletters, order confirmations, past travel bookings, statements |
+| `SOCIAL_REAL` | ignore | Direct messages, @mentions, personal LinkedIn messages |
+| `TRANSACTIONAL` | ignore | Active orders, upcoming travel, pending payments, recent OTPs |
+| `REVIEW` | ignore | Personal messages, work email, calendar invites — **never auto-deleted** |
 
-- Only `fetch` and `trash` touch Gmail. `classify` is purely local + Claude API.
-- `trash` moves to Gmail Trash, **not permanent deletion**. Recoverable for 30 days.
-- `REVIEW` category is hard-locked and never queued for deletion.
-- To permanently delete after trashing: Gmail → Trash → Empty Trash.
+Classification considers email age, sender, subject, and Gmail category labels. When in doubt, emails default to `REVIEW`.
+
+---
+
+## Report interactive modes
+
+The `report` command offers three levels of control:
+
+- **Quick-approve** — apply all default actions (delete/archive/ignore) immediately
+- **Per-category review** — approve, change action, or drill into per-sender selection for each category
+- **Per-sender selection** — review senders grouped by domain, choose delete/archive/ignore for each group
+
+---
+
+## Filters workflow
+
+The `filters` command creates Gmail filters to prevent future inbox clutter:
+
+1. **Fetch** — retrieves 3 months of inbox emails (cached for 24 hours in `filter_analysis.json`)
+2. **Analyze** — groups by sender/domain, computes read ratios (never / rarely / mixed / regular)
+3. **Subject analysis** — Claude analyzes "mixed" tier sources to find filterable subject patterns
+4. **Propose** — generates filter proposals for rarely-read and pattern-matched sources
+5. **Approve** — quick-approve high-confidence filters, review each individually, or export only
+6. **Create** — approved filters are created via Gmail API
+
+---
+
+## Environment variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ANTHROPIC_API_KEY` | Anthropic API key for Claude classification | (required) |
+| `CUTOFF_DATE` | Only process emails older than this date (`YYYY-MM-DD`) | 1 year ago |
+
+---
 
 ## File outputs
 
-| File              | Contents                          |
-|-------------------|-----------------------------------|
-| `token.json`      | OAuth token (auto-created)        |
-| `unread.json`     | All fetched email metadata        |
-| `classified.json` | Emails grouped by category        |
-| `classified.csv`  | Flat export for spreadsheet review|
+| File | Created by | Contents |
+|------|-----------|----------|
+| `token.json` | `fetch` | OAuth token (auto-created on first run) |
+| `unread.json` | `fetch` | All fetched unread email metadata |
+| `classified.json` | `classify` | Emails grouped by category |
+| `classified.csv` | `export` | Flat export for spreadsheet review |
+| `audit.csv` | `report` | Decisions log (written before execution) |
+| `report_progress.json` | `report` | Resume state for interrupted sessions (auto-deleted on success) |
+| `filter_analysis.json` | `filters` | Cached email data with read/unread flags |
+| `filter_proposals.json` | `filters` | Proposed filter definitions |
+| `errors.log` | any | Timestamped errors with stage and exception details |
+
+---
+
+## Other
+
+- `report` moves emails to Gmail Trash, recoverable for 30 days. To permanently delete: Gmail → Trash → Empty Trash.
+- exponential backoff on 429 errors, sleeps tuned to Gmail API quota (15,000 units/min).
